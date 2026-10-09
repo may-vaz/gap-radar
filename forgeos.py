@@ -544,7 +544,7 @@ Return 4-{self.max_components} purchasable component categories that form a comp
             "cycles": cycles, "rejected_edges": rejected,
         }
 
-    def optimize(self, design: Design, market: dict[str, Any], req: CompileRequest, strategy: Literal["cheapest", "balanced", "resilient"], blocked_suppliers: set[str] | None = None) -> dict[str, Any]:
+    def optimize(self, design: Design, market: dict[str, Any], req: CompileRequest, strategy: Literal["cheapest", "balanced", "resilient"], blocked_suppliers: set[str] | None = None, supplier_cap: int | None = None) -> dict[str, Any]:
         blocked = {x.lower() for x in (blocked_suppliers or set())}
         model = cp_model.CpModel()
         variables: dict[str, Any] = {}
@@ -570,6 +570,9 @@ Return 4-{self.max_components} purchasable component categories that form a comp
                     model.add(sum(comp_vars) == 1)
         if not rows:
             return {"strategy": strategy, "status": "infeasible", "reason": "No market candidates"}
+        if supplier_cap is not None:
+            for vals in supplier_vars.values():
+                model.add(sum(vals) <= max(1, supplier_cap))
         total_cost = sum(cents * variables[c["id"]] for _, c, _, cents in rows)
         model.add(total_cost <= int(req.budget * 100))
         max_exposure = model.new_int_var(0, len(design.components), "max_supplier_exposure")
@@ -650,6 +653,36 @@ Return 4-{self.max_components} purchasable component categories that form a comp
                                          "estimated_reserve_cost": hardening["price"]} if hardening else None),
             "assumptions": "Seeded stress model; probabilities are decision-support estimates derived from evidence completeness, not supplier guarantees.",
         }
+
+    @staticmethod
+    def readiness(plan: dict[str, Any], chaos: dict[str, Any], req: CompileRequest) -> dict[str, Any]:
+        """Deterministic release gate with an explainable 0-100 score and action list."""
+        if plan.get("status") not in {"optimal", "feasible"}:
+            return {"score": 0, "verdict": "NOT_READY", "gates": [], "actions": [plan.get("reason", "No feasible procurement plan")]}
+        selections = plan.get("selections", [])
+        verified = sum(x.get("compatibility") == "verified" for x in selections)
+        evidence_ratio = verified / len(selections) if selections else 0
+        completion = float(chaos.get("completion_probability", 0))
+        on_time = float(chaos.get("on_time_probability", 0))
+        supplier_count = int(plan.get("supplier_count", 0))
+        max_exposure = int(plan.get("max_supplier_exposure", 0))
+        diversity = 1.0 if supplier_count >= 2 else 0.35
+        headroom_ratio = max(0.0, min(1.0, float(plan.get("budget_remaining", 0)) / max(req.budget, 1)))
+        score = round(40 * completion + 20 * on_time + 20 * evidence_ratio + 10 * diversity + 10 * headroom_ratio)
+        gates = [
+            {"name": "Budget", "passed": plan.get("total_cost", req.budget + 1) <= req.budget, "detail": f"{plan.get('budget_remaining', 0):.2f} budget remaining"},
+            {"name": "Component coverage", "passed": bool(selections), "detail": f"{len(selections)} required categories selected"},
+            {"name": "Compatibility evidence", "passed": evidence_ratio == 1, "detail": f"{verified} of {len(selections)} selected items verified"},
+            {"name": "Supplier resilience", "passed": supplier_count >= 2 and max_exposure < len(selections), "detail": f"{supplier_count} suppliers; maximum exposure {max_exposure} components"},
+            {"name": "Completion probability", "passed": completion >= 0.85, "detail": f"{completion * 100:.0f}% simulated completion"},
+        ]
+        actions = []
+        if evidence_ratio < 1: actions.append("Confirm specifications for every item marked Review required.")
+        if supplier_count < 2: actions.append("Qualify at least one additional supplier before purchase approval.")
+        if completion < 0.85: actions.append("Apply the recommended reserve or alternative-supplier hardening action.")
+        if headroom_ratio < 0.1: actions.append("Add budget contingency for price and delivery variation.")
+        verdict = "READY" if score >= 85 and all(g["passed"] for g in gates) else "CONDITIONAL" if score >= 60 else "NOT_READY"
+        return {"score": score, "verdict": verdict, "gates": gates, "actions": actions or ["No blocking action remains; retain evidence before purchase approval."]}
 
     @staticmethod
     def economics(plan: dict[str, Any], req: CompileRequest) -> dict[str, Any]:
@@ -750,7 +783,7 @@ Return 4-{self.max_components} purchasable component categories that form a comp
                 "decision": "Capability leads only; request a quote before make-versus-buy comparison."}
 
     def _certificate(self, payload: dict[str, Any]) -> dict[str, Any]:
-        binding = {"design": payload["design"], "evidence": payload["evidence"], "plans": payload["plans"], "chaos": payload["chaos"], "economics": payload.get("economics", {}), "commercial": payload.get("commercial", {})}
+        binding = {"design": payload["design"], "evidence": payload["evidence"], "plans": payload["plans"], "chaos": payload["chaos"], "readiness": payload.get("readiness", {}), "economics": payload.get("economics", {}), "commercial": payload.get("commercial", {}), "scenario": payload.get("scenario", {})}
         digest = canonical_hash(binding)
         feasible = [x for x in payload["plans"] if x.get("status") in {"optimal", "feasible"}]
         return {
@@ -772,13 +805,15 @@ Return 4-{self.max_components} purchasable component categories that form a comp
         evidence = self.market(design, req, budget)
         plans = [self.optimize(design, evidence, req, x) for x in ("cheapest", "balanced", "resilient")]
         preferred = next((x for x in plans if x["strategy"] == "balanced" and x.get("status") in {"optimal", "feasible"}), plans[0])
+        chaos = self.chaos(preferred, req.deadline_days)
+        readiness = self.readiness(preferred, chaos, req)
         commercial = self.commercial_viability(design, req, preferred, budget)
         fabrication = self.local_fabricators(req, budget)
         payload = {
             "project_id": uuid.uuid4().hex[:12], "created_at": now_iso(),
             "demand_key": project_demand_key(req.model_dump()), "request": req.model_dump(),
             "design": design.model_dump(), "graph": self.graph(design), "evidence": evidence, "plans": plans,
-            "chaos": self.chaos(preferred, req.deadline_days), "economics": self.economics(preferred, req),
+            "chaos": chaos, "readiness": readiness, "economics": self.economics(preferred, req),
             "commercial": commercial, "fabrication": fabrication,
             "operation_searches": {"live_searches": budget.used, "limit": budget.limit},
         }
@@ -825,17 +860,95 @@ Make at least one genuine design-level technical substitution for an affected ca
             prior = before.get(comp.id)
             if not prior or prior.model_dump() != comp.model_dump():
                 changes.append({"component_id": comp.id, "before": prior.model_dump() if prior else None, "after": comp.model_dump()})
+        chaos = self.chaos(chosen, req.deadline_days)
+        readiness = self.readiness(chosen, chaos, req)
         commercial = self.commercial_viability(revised, req, chosen, budget)
         payload = {
             "project_id": uuid.uuid4().hex[:12], "parent_project_id": project_id, "created_at": now_iso(),
             "demand_key": old.get("demand_key") or project_demand_key(req.model_dump()),
             "repair": {"blocked_supplier": supplier, "mutation_count": len(changes), "changes": changes},
             "request": req.model_dump(), "design": revised.model_dump(), "graph": self.graph(revised), "evidence": evidence,
-            "plans": plans, "chaos": self.chaos(chosen, req.deadline_days), "economics": self.economics(chosen, req),
+            "plans": plans, "chaos": chaos, "readiness": readiness, "economics": self.economics(chosen, req),
             "commercial": commercial, "fabrication": old.get("fabrication", {}),
             "operation_searches": {"live_searches": budget.used, "limit": budget.limit},
         }
         payload["serpapi_quota"] = self.quota()
+        payload["certificate"] = self._certificate(payload)
+        self.store.save_project(payload["project_id"], payload)
+        return payload
+    def scenario(self, project_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+        """Run a no-search what-if scenario against an existing evidence snapshot."""
+        old = self.store.get_project(project_id)
+        blocked_supplier = str(raw.get("blocked_supplier") or "").strip()
+        price_shock = max(0.0, min(200.0, float(raw.get("price_shock_percent") or 0)))
+        budget_reduction = max(0.0, min(80.0, float(raw.get("budget_reduction_percent") or 0)))
+        deadline_days = int(raw.get("deadline_days") or old["request"].get("deadline_days", 21))
+        diversify = bool(raw.get("require_supplier_diversity", False))
+        if not blocked_supplier and not price_shock and not budget_reduction and not diversify and deadline_days == old["request"].get("deadline_days", 21):
+            raise ForgeError("Choose at least one stress condition before running the scenario", 422)
+        request_data = dict(old["request"])
+        request_data["budget"] = round(float(request_data["budget"]) * (1 - budget_reduction / 100), 2)
+        request_data["deadline_days"] = max(1, min(365, deadline_days))
+        req = CompileRequest.model_validate(request_data)
+        design = Design.model_validate(old["design"])
+        evidence = json.loads(json.dumps(old["evidence"]))
+        if price_shock:
+            multiplier = 1 + price_shock / 100
+            for entry in evidence.values():
+                for candidate in entry.get("candidates", []):
+                    candidate["price"] = round(float(candidate["price"]) * multiplier, 2)
+                    candidate["price_text"] = f"Scenario-adjusted +{price_shock:.0f}%"
+        supplier_cap = max(1, math.ceil(len(design.components) / 2)) if diversify else None
+        blocked = {blocked_supplier} if blocked_supplier else set()
+        plans = [self.optimize(design, evidence, req, strategy, blocked, supplier_cap) for strategy in ("cheapest", "balanced", "resilient")]
+        chosen = next((p for p in plans if p.get("strategy") == "balanced" and p.get("status") in {"optimal", "feasible"}),
+                      next((p for p in plans if p.get("status") in {"optimal", "feasible"}), plans[0]))
+        chaos = self.chaos(chosen, req.deadline_days)
+        readiness = self.readiness(chosen, chaos, req)
+        baseline = next((p for p in old["plans"] if p.get("strategy") == "balanced" and p.get("status") in {"optimal", "feasible"}),
+                        next((p for p in old["plans"] if p.get("status") in {"optimal", "feasible"}), old["plans"][0]))
+        baseline_items = {x["component_id"]: x for x in baseline.get("selections", [])}
+        revised_items = {x["component_id"]: x for x in chosen.get("selections", [])}
+        changes = []
+        for component_id in sorted(set(baseline_items) | set(revised_items)):
+            before, after = baseline_items.get(component_id), revised_items.get(component_id)
+            if (before or {}).get("id") != (after or {}).get("id"):
+                changes.append({
+                    "component_id": component_id,
+                    "component_name": (after or before or {}).get("component_name", component_id),
+                    "before": {"product": before.get("title"), "supplier": before.get("supplier"), "cost": before.get("line_cost")} if before else None,
+                    "after": {"product": after.get("title"), "supplier": after.get("supplier"), "cost": after.get("line_cost")} if after else None,
+                })
+        scenario_info = {
+            "blocked_supplier": blocked_supplier or None,
+            "price_shock_percent": price_shock,
+            "budget_reduction_percent": budget_reduction,
+            "deadline_days": req.deadline_days,
+            "require_supplier_diversity": diversify,
+            "uses_new_searches": False,
+        }
+        comparison = {
+            "baseline_project_id": project_id,
+            "baseline_cost": baseline.get("total_cost"),
+            "revised_cost": chosen.get("total_cost") if chosen.get("status") in {"optimal", "feasible"} else None,
+            "cost_change": round(float(chosen.get("total_cost", 0)) - float(baseline.get("total_cost", 0)), 2) if chosen.get("total_cost") is not None else None,
+            "baseline_completion": old.get("chaos", {}).get("completion_probability"),
+            "revised_completion": chaos.get("completion_probability"),
+            "baseline_readiness": old.get("readiness", {}).get("score"),
+            "revised_readiness": readiness.get("score"),
+            "changed_components": changes,
+            "feasible": chosen.get("status") in {"optimal", "feasible"},
+        }
+        payload = {
+            "project_id": uuid.uuid4().hex[:12], "parent_project_id": project_id, "created_at": now_iso(),
+            "demand_key": old.get("demand_key") or project_demand_key(old.get("request", {})),
+            "scenario": scenario_info, "comparison": comparison, "request": req.model_dump(),
+            "design": old["design"], "graph": old.get("graph", self.graph(design)), "evidence": evidence,
+            "plans": plans, "chaos": chaos, "readiness": readiness, "economics": self.economics(chosen, req),
+            "commercial": old.get("commercial", {}), "fabrication": old.get("fabrication", {}),
+            "operation_searches": {"live_searches": 0, "limit": self.serp_operation_limit},
+            "serpapi_quota": self.quota(),
+        }
         payload["certificate"] = self._certificate(payload)
         self.store.save_project(payload["project_id"], payload)
         return payload

@@ -67,7 +67,10 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/projects/([a-zA-Z0-9_-]+)/heal", path)
         if method == "POST" and match:
             return self._json(201, APP.heal(match.group(1), self._body()))
-        if method == "GET" and path in ("/", "/index.html"):
+        match = re.fullmatch(r"/api/projects/([a-zA-Z0-9_-]+)/scenario", path)
+        if method == "POST" and match:
+            return self._json(201, APP.scenario(match.group(1), self._body()))
+        if method == "GET" and path in ("/", "/index.html"): 
             return self._file(ROOT / "index.html")
         raise ForgeError("Route not found", 404)
 
