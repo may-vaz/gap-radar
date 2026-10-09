@@ -219,6 +219,18 @@ def project_demand_key(request: dict[str, Any]) -> str:
     return canonical_hash({"intent": intent, "quantity": request.get("quantity"), "location": location})[:16]
 
 
+def normalize_supplier_name(value: Any) -> str:
+    """Collapse whitespace and case-only merchant variants into one display name."""
+    raw = re.sub(r"\s+", " ", str(value or "Unknown merchant")).strip()
+    key = raw.casefold()
+    known = {"amazon.in": "Amazon.in", "amazon": "Amazon", "amazon india": "Amazon.in"}
+    if key in known:
+        return known[key]
+    if raw.islower() or raw.isupper():
+        return raw.title()
+    return raw
+
+
 def slug(value: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     return value[:48] or "item"
@@ -491,7 +503,7 @@ Return 4-{self.max_components} purchasable component categories that form a comp
             product_ref = str(item.get("product_id") or item.get("immersive_product_page_token") or f"{idx}-{canonical_hash(item)[:8]}")
             candidates.append({
                 "id": f"{component.id}:{product_ref[:40]}", "component_id": component.id,
-                "title": item.get("title", "Untitled product"), "supplier": item.get("source", "Unknown merchant"),
+                "title": item.get("title", "Untitled product"), "supplier": normalize_supplier_name(item.get("source")),
                 "price": round(float(price), 2), "price_text": item.get("price", str(price)),
                 "pack_size": self._pack_size(evidence_text), "rating": rating or None, "reviews": reviews,
                 "delivery": item.get("delivery"), "link": item.get("product_link") or item.get("link"),
@@ -556,7 +568,9 @@ Return 4-{self.max_components} purchasable component categories that form a comp
                 return {"strategy": strategy, "status": "infeasible", "reason": f"No candidate remains for {comp.name}"}
             comp_vars = []
             demand = req.quantity * comp.quantity_per_unit
-            for candidate in usable:
+            for source_candidate in usable:
+                candidate = dict(source_candidate)
+                candidate["supplier"] = normalize_supplier_name(candidate.get("supplier"))
                 packages = math.ceil(demand / candidate["pack_size"])
                 cents = int(round(candidate["price"] * packages * 100))
                 var = model.new_bool_var(slug(candidate["id"]))
@@ -727,7 +741,7 @@ Return 4-{self.max_components} purchasable component categories that form a comp
                 continue
             comparables.append({
                 "title": item.get("title", "Comparable product"),
-                "supplier": item.get("source", "Unknown merchant"),
+                "supplier": normalize_supplier_name(item.get("source")),
                 "price": round(float(price), 2),
                 "rating": item.get("rating"),
                 "reviews": item.get("reviews"),
@@ -792,7 +806,7 @@ Return 4-{self.max_components} purchasable component categories that form a comp
             "design_hash": canonical_hash(payload["design"]), "evidence_hash": canonical_hash(payload["evidence"]),
             "solver": "OR-Tools CP-SAT 9.15", "evidence_source": "SerpApi Google Shopping / Maps",
             "passed": ["priced_candidate_per_required_component", "budget_constraint", "quantity_and_pack_coverage"] if feasible else [],
-            "warnings": ["Compatibility marked needs_review requires human confirmation", "Market evidence is time-bound; recompile before purchase"],
+            "warnings": ["Some selected products require manual specification confirmation.", "Prices and availability can change; refresh the plan before purchasing."],
         }
 
     def compile(self, raw: dict[str, Any]) -> dict[str, Any]:
