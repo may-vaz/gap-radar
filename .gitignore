@@ -1,0 +1,9 @@
+.env
+.ENV
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+forgeos.db
+forgeos.db-*
+.DS_Store
