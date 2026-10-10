@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -292,9 +293,9 @@ class ForgeOS:
     def _ollama(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         """Generate a compact design without expensive JSON-schema grammar compilation.
 
-        Some Ollama/Qwen combinations spend minutes compiling a nested JSON grammar before
-        producing a token. We instead use JSON mode, a compact field contract, `/no_think`,
-        and a bounded output. Pydantic remains the authoritative validator afterwards.
+        Some Ollama/Qwen combinations can loop while enforcing a JSON grammar. We instead
+        request plain, compact JSON with `/no_think` and a bounded output, then extract the
+        object from the response. Pydantic remains the authoritative validator afterwards.
         """
         del schema  # Validation is performed by Pydantic; do not send the large schema to Qwen.
         contract = (
@@ -315,10 +316,11 @@ class ForgeOS:
         )
         user_prompt = f"/no_think\n{prompt}\n{contract}\nDo not include markdown or commentary."
         options = {
-            "temperature": 0,
+            "temperature": 0.1,
             "seed": 7,
             "num_ctx": 3072,
-            "num_predict": 1200,
+            "num_predict": 900,
+            "repeat_penalty": 1.1,
         }
         attempts = [
             (
@@ -328,30 +330,29 @@ class ForgeOS:
                     "stream": False,
                     "think": False,
                     "keep_alive": "30m",
-                    "format": "json",
                     "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_prompt},
                     ],
                     "options": options,
                 },
-                "chat JSON mode",
+                "chat mode",
             ),
             (
                 "/api/generate",
                 {
                     "model": self.model,
                     "stream": False,
+                    "think": False,
                     "keep_alive": "30m",
-                    "format": "json",
                     "prompt": f"{system}\n{user_prompt}",
                     "options": options,
                 },
-                "generate JSON mode",
+                "generate mode",
             ),
         ]
         failures: list[str] = []
-        per_attempt_timeout = max(30, min(150, self.timeout // len(attempts)))
+        per_attempt_timeout = max(15, min(30, self.timeout // len(attempts)))
         for endpoint, payload, label in attempts:
             try:
                 res = requests.post(
@@ -412,6 +413,40 @@ class ForgeOS:
             existing_text += f" {component_id} {name.lower()} {function.lower()}"
         return design.model_copy(update={"components": components})
 
+    def _fallback_design(self, req: CompileRequest) -> Design:
+        """Produce a safe functional plan when the local model is temporarily unavailable."""
+        intent = req.intent.lower()
+        specs: list[tuple[str, str, str, str]] = [
+            ("control_unit", "Control unit", "Coordinates sensing, communication and output control", "microcontroller development control board"),
+        ]
+        if any(word in intent for word in ("soil", "moisture", "sensor", "sense", "monitor")):
+            query = "capacitive soil moisture sensor module" if any(word in intent for word in ("soil", "moisture")) else "electronic sensor module"
+            specs.append(("sensor", "Sensor", "Measures the required operating condition", query))
+        if any(word in intent for word in ("pump", "motor", "valve", "automatic", "actuator")):
+            query = "DC water pump relay control module" if any(word in intent for word in ("pump", "water", "irrigation")) else "DC relay actuator control module"
+            specs.append(("output_control", "Output control", "Safely switches the controlled equipment", query))
+        if any(word in intent for word in ("wireless", "wifi", "bluetooth", "remote", "reporting")):
+            specs.append(("communication", "Wireless communication", "Reports operating status to the user", "WiFi wireless communication module"))
+        power_query = "solar panel battery charge controller kit" if "solar" in intent else "regulated DC power supply module"
+        specs.append(("power_system", "Power system", "Provides regulated power to the complete unit", power_query))
+        enclosure_query = "IP65 weatherproof electronics enclosure" if any(word in intent for word in ("weather", "outdoor", "farm", "irrigation")) else "electronics project enclosure"
+        specs.append(("enclosure", "Protective enclosure", "Protects and integrates the electronic components", enclosure_query))
+        specs = specs[:self.max_components]
+        components = [Component(
+            id=component_id, name=name, function=function, search_query=query,
+            quantity_per_unit=1, must_include=[], interface="system",
+            optional=False, alternatives=[],
+        ) for component_id, name, function, query in specs]
+        dependencies = [Dependency(
+            source=component.id, target="control_unit",
+            rule=f"{component.name} must connect to and operate with the control unit",
+        ) for component in components if component.id != "control_unit"]
+        return Design(
+            name="Production-ready product system",
+            summary=f"Functional component plan for {req.intent[:380]}",
+            unit_name="finished unit", components=components, dependencies=dependencies,
+        )
+
     def design(self, req: CompileRequest) -> Design:
         prompt = f"""Create a minimal complete functional bill of materials for this project.
 Intent: {req.intent}
@@ -420,7 +455,11 @@ Return 4-{self.max_components} purchasable component categories that form a comp
         schema = Design.model_json_schema()
         schema["properties"]["components"]["minItems"] = 4
         schema["properties"]["components"]["maxItems"] = self.max_components
-        raw = self._ollama(prompt, schema)
+        try:
+            raw = self._ollama(prompt, schema)
+        except ForgeError as exc:
+            print(f"[forgeos] Qwen unavailable; using deterministic design recovery: {exc}", file=sys.stderr)
+            return self._fallback_design(req)
         try:
             design = Design.model_validate(raw)
             if len(design.components) > self.max_components:

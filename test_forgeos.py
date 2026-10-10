@@ -137,7 +137,8 @@ class ForgeOSTests(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assertTrue(post.call_args_list[0].args[0].endswith("/api/chat"))
         self.assertTrue(post.call_args_list[1].args[0].endswith("/api/generate"))
-        self.assertEqual(post.call_args_list[0].kwargs["json"]["format"], "json")
+        self.assertNotIn("format", post.call_args_list[0].kwargs["json"])
+        self.assertFalse(post.call_args_list[0].kwargs["json"]["think"])
 
 
 if __name__ == "__main__": unittest.main()
